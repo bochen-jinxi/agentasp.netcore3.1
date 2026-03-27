@@ -6,9 +6,9 @@ from datetime import datetime
 
 # 测试配置
 TARGET_URL = "http://localhost:5000/api/v1/HighPerformance/async-process"
-TOTAL_REQUESTS = 100000000  # 1亿个请求
+TOTAL_REQUESTS = 17000  # 17000个请求
 TEST_DURATION = 60  # 60秒
-CONCURRENT_CONNECTIONS = 1000  # 并发连接数
+CONCURRENT_CONNECTIONS = 100  # 并发连接数
 
 # 测试数据
 TEST_DATA = {

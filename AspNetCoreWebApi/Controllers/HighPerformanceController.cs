@@ -32,6 +32,10 @@ namespace AspNetCoreWebApi.Controllers
         private static DateTime _lastBatchTime = DateTime.UtcNow;
         private static readonly object _batchLock = new object();
 
+        // 暴露给 BufferFlushService
+        public static ConcurrentQueue<byte[]> MessageBuffer => _messageBuffer;
+        public static object BatchLock => _batchLock;
+
         public HighPerformanceController(
             IMemoryCache memoryCache,
             IDistributedCache distributedCache,
@@ -100,35 +104,34 @@ namespace AspNetCoreWebApi.Controllers
             // 使用 MessagePack 序列化（比 JSON 快 10-100 倍，体积更小）
             var message = MessagePackSerializer.Serialize(request, MessagePackSerializerOptions.Standard);
 
-            // 加入缓冲区
-            _messageBuffer.Enqueue(message);
-
             // 检查是否需要批量发送
-            var shouldFlush = false;
             var messagesToFlush = new List<byte[]>();
 
             lock (_batchLock)
             {
+                // 加入缓冲区
+                _messageBuffer.Enqueue(message);
+                
                 var now = DateTime.UtcNow;
                 var bufferCount = _messageBuffer.Count;
 
                 // 条件1：缓冲区达到批量大小
                 // 条件2：超过时间间隔且缓冲区有数据
-                if (bufferCount >= _batchSize || (bufferCount > 0 && (now - _lastBatchTime) >= _batchInterval))
+                if (bufferCount >= _batchSize || 
+                    (bufferCount > 0 && (now - _lastBatchTime) >= _batchInterval))
                 {
-                    shouldFlush = true;
                     _lastBatchTime = now;
 
-                    // 取出消息
-                    while (messagesToFlush.Count < _batchSize && _messageBuffer.TryDequeue(out var msg))
+                    // 取出所有消息（确保不丢失）
+                    while (_messageBuffer.TryDequeue(out var msg))
                     {
                         messagesToFlush.Add(msg);
                     }
                 }
             }
 
-            // 批量发送
-            if (shouldFlush && messagesToFlush.Count > 0)
+            // 批量发送（在 lock 外执行，避免阻塞）
+            if (messagesToFlush.Count > 0)
             {
                 await _messageQueue.PublishBatchAsync("async_tasks", messagesToFlush).ConfigureAwait(false);
             }

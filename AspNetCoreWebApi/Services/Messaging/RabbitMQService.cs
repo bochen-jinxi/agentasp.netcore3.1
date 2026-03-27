@@ -87,18 +87,33 @@ namespace AspNetCoreWebApi.Services.Messaging
 
             try
             {
-                // 从池中获取通道
-                if (_channelPool.Reader.TryRead(out var channel))
+                // 从池中获取通道，如果池为空则创建新通道
+                IModel channel = null;
+                bool fromPool = _channelPool.Reader.TryRead(out channel);
+                
+                if (!fromPool)
                 {
-                    try
-                    {
-                        // 直接使用二进制数据，无需编码转换
-                        channel.BasicPublish(exchange: "", routingKey: queueName, basicProperties: null, body: message);
-                    }
-                    finally
+                    // 池为空，创建临时通道
+                    channel = _connectionManager.CreateChannel();
+                }
+
+                try
+                {
+                    // 直接使用二进制数据，无需编码转换
+                    channel.BasicPublish(exchange: "", routingKey: queueName, basicProperties: null, body: message);
+                }
+                finally
+                {
+                    if (fromPool)
                     {
                         // 归还通道
                         _channelPool.Writer.TryWrite(channel);
+                    }
+                    else
+                    {
+                        // 临时通道直接关闭
+                        channel.Close();
+                        channel.Dispose();
                     }
                 }
             }
@@ -122,24 +137,39 @@ namespace AspNetCoreWebApi.Services.Messaging
 
             try
             {
-                if (_channelPool.Reader.TryRead(out var channel))
+                // 从池中获取通道，如果池为空则创建新通道
+                IModel channel = null;
+                bool fromPool = _channelPool.Reader.TryRead(out channel);
+                
+                if (!fromPool)
                 {
-                    try
+                    // 池为空，创建临时通道
+                    channel = _connectionManager.CreateChannel();
+                }
+
+                try
+                {
+                    // 使用 RabbitMQ 批量发布 API（最高效）
+                    var batch = channel.CreateBasicPublishBatch();
+                    
+                    for (int i = 0; i < messages.Count; i++)
                     {
-                        // 使用 RabbitMQ 批量发布 API（最高效）
-                        var batch = channel.CreateBasicPublishBatch();
-                        
-                        for (int i = 0; i < messages.Count; i++)
-                        {
-                            batch.Add(exchange: "", routingKey: queueName, mandatory: false, properties: null, body: messages[i]);
-                        }
-                        
-                        // 一次性发送所有消息
-                        batch.Publish();
+                        batch.Add(exchange: "", routingKey: queueName, mandatory: false, properties: null, body: messages[i]);
                     }
-                    finally
+                    
+                    // 一次性发送所有消息
+                    batch.Publish();
+                }
+                finally
+                {
+                    if (fromPool)
                     {
                         _channelPool.Writer.TryWrite(channel);
+                    }
+                    else
+                    {
+                        channel.Close();
+                        channel.Dispose();
                     }
                 }
             }

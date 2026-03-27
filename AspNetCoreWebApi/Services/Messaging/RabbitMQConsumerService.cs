@@ -38,7 +38,27 @@ namespace AspNetCoreWebApi.Services.Messaging
 
         // 统计
         private static int _processedCount = 0;
+        private static int _ackedCount = 0;
+        private static int _nackedCount = 0;
+        private static int _receivedCount = 0;
         private static readonly Random _random = new Random();
+        private static readonly object _logLock = new object();
+        private static readonly string _logFile = "consumer_debug.log";
+        
+        // 详细日志
+        private void LogDebug(string message)
+        {
+            var logMessage = $"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.fff}] [Thread:{Thread.CurrentThread.ManagedThreadId}] {message}";
+            _logger.LogInformation(message);
+            try
+            {
+                lock (_logLock)
+                {
+                    System.IO.File.AppendAllText(_logFile, logMessage + Environment.NewLine);
+                }
+            }
+            catch { }
+        }
 
         public RabbitMQConsumerService(
             RabbitMQConnectionManager connectionManager,
@@ -119,16 +139,32 @@ namespace AspNetCoreWebApi.Services.Messaging
                     var consumer = new AsyncEventingBasicConsumer(channel);
                     consumer.Received += async (model, ea) =>
                     {
+                        var receivedNum = Interlocked.Increment(ref _receivedCount);
+                        LogDebug($"[RECEIVE] 消息到达 #{receivedNum}, DeliveryTag={ea.DeliveryTag}");
+                        
                         var batchItem = new BatchItem
                         {
                             DeliveryTag = ea.DeliveryTag,
                             Channel = channel,
-                            Message = ea.Body.ToArray()
+                            Message = ea.Body.ToArray(),
+                            SequenceNumber = receivedNum
                         };
 
-                        // 加入批量队列（阻塞直到有空间）
-                        _batchQueue.Add(batchItem, stoppingToken);
-                        await Task.CompletedTask; // 显式消除 async 警告
+                        // 加入批量队列
+                        try
+                        {
+                            _batchQueue.Add(batchItem, stoppingToken);
+                            LogDebug($"[QUEUE] 消息入队 #{receivedNum}, DeliveryTag={ea.DeliveryTag}, QueueCount={_batchQueue.Count}");
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            LogDebug($"[CANCEL] 应用停止，消息未入队 #{receivedNum}, DeliveryTag={ea.DeliveryTag}");
+                        }
+                        catch (Exception ex)
+                        {
+                            LogDebug($"[ERROR] 加入队列失败 #{receivedNum}, DeliveryTag={ea.DeliveryTag}, Error={ex.Message}");
+                        }
+                        await Task.CompletedTask;
                     };
 
                     channel.BasicConsume(queue: "async_tasks", autoAck: false, consumer: consumer);
@@ -164,6 +200,7 @@ namespace AspNetCoreWebApi.Services.Messaging
             while (!stoppingToken.IsCancellationRequested && !_batchQueue.IsCompleted)
             {
                 var batch = new List<BatchItem>();
+                var successItems = new List<BatchItem>();  // 移到 try 外部，catch 可以访问
 
                 try
                 {
@@ -188,8 +225,10 @@ namespace AspNetCoreWebApi.Services.Messaging
                     await timeoutTask;
 
                     if (batch.Count == 0) continue;
+                    
+                    LogDebug($"[BATCH] 开始处理批次, 消息数={batch.Count}, 序号范围=#{batch[0].SequenceNumber}-#{batch[batch.Count-1].SequenceNumber}");
 
-                    // 处理消息
+                    // 处理消息，记录成功处理的消息
                     foreach (var item in batch)
                     {
                         try
@@ -205,12 +244,19 @@ namespace AspNetCoreWebApi.Services.Messaging
                                     TemperatureC = _random.Next(-20, 55),
                                     Summary = taskData.TaskType ?? "Processed"
                                 });
+                                successItems.Add(item);  // 记录成功处理的消息
+                            }
+                            else
+                            {
+                                // 空消息，直接确认（不写入数据库，但算处理成功）
+                                LogDebug($"[EMPTY] 空消息 #{item.SequenceNumber}, DeliveryTag={item.DeliveryTag}");
+                                TryAckMessage(item);
                             }
                         }
                         catch (Exception ex)
                         {
-                            _logger.LogError(ex, "反序列化消息失败");
-                            item.Channel.BasicNack(deliveryTag: item.DeliveryTag, multiple: false, requeue: false);
+                            LogDebug($"[DESERIALIZE_FAIL] 反序列化失败 #{item.SequenceNumber}, DeliveryTag={item.DeliveryTag}, Error={ex.Message}");
+                            TryNackMessage(item, requeue: false);  // 脏数据，丢弃
                         }
                     }
 
@@ -223,48 +269,97 @@ namespace AspNetCoreWebApi.Services.Messaging
                         dbContext.WeatherForecasts.AddRange(forecasts);
                         await dbContext.SaveChangesAsync();
 
-                        // 写入成功后，批量确认消息
-                        foreach (var item in batch)
+                        // 写入成功后，只确认成功处理的消息
+                        foreach (var item in successItems)
                         {
-                            try
-                            {
-                                if (item.Channel.IsOpen)
-                                {
-                                    item.Channel.BasicAck(deliveryTag: item.DeliveryTag, multiple: false);
-                                }
-                            }
-                            catch
-                            {
-                                // 通道可能已关闭
-                            }
+                            LogDebug($"[ACK] 确认消息 #{item.SequenceNumber}, DeliveryTag={item.DeliveryTag}");
+                            TryAckMessage(item);
                         }
 
                         var count = Interlocked.Add(ref _processedCount, forecasts.Count);
-                        if (count % 1000 == 0)
+                        LogDebug($"[BATCH_DONE] 批量完成, 写入={forecasts.Count}, 累计={count}, Ack={_ackedCount}, Nack={_nackedCount}");
+                    }
+                    else if (successItems.Count > 0)
+                    {
+                        // forecasts.Count == 0 但 successItems.Count > 0 不应该发生
+                        LogDebug($"[WARN] 异常: forecasts=0 但 successItems={successItems.Count}");
+                        foreach (var item in successItems)
                         {
-                            _logger.LogInformation("已处理消息: {Count}, 本次批量写入: {BatchCount}", count, forecasts.Count);
+                            TryAckMessage(item);
                         }
+                    }
+                    else if (batch.Count > 0)
+                    {
+                        // batch 有消息但 forecasts 和 successItems 都为空
+                        LogDebug($"[BATCH_EMPTY] 批次无数据写入, batch={batch.Count}");
                     }
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "批量写入数据库失败，准备将 {Count} 条消息重新退回队列", batch.Count);
+                    LogDebug($"[DB_ERROR] 批量写入数据库失败，准备将 {successItems.Count} 条消息重新退回队列，错误: {ex.Message}");
 
-                    // 数据库写入失败时，必须将消息重新入队
-                    foreach (var item in batch)
+                    // 数据库写入失败时，只对 successItems 进行 Nack requeue
+                    // 其他消息（反序列化失败）已经 Nack 过了
+                    foreach (var item in successItems)
                     {
-                        try
-                        {
-                            if (item.Channel.IsOpen)
-                            {
-                                item.Channel.BasicNack(deliveryTag: item.DeliveryTag, multiple: false, requeue: true);
-                            }
-                        }
-                        catch { }
+                        TryNackMessage(item, requeue: true);
                     }
 
                     await Task.Delay(1000, stoppingToken);
                 }
+            }
+        }
+
+        /// <summary>
+        /// 安全确认消息
+        /// </summary>
+        private void TryAckMessage(BatchItem item)
+        {
+            try
+            {
+                if (item.Channel == null)
+                {
+                    _logger.LogWarning("Ack 失败: 通道为 null, DeliveryTag={DeliveryTag}", item.DeliveryTag);
+                    return;
+                }
+                if (!item.Channel.IsOpen)
+                {
+                    _logger.LogWarning("Ack 失败: 通道已关闭, DeliveryTag={DeliveryTag}", item.DeliveryTag);
+                    return;
+                }
+                item.Channel.BasicAck(deliveryTag: item.DeliveryTag, multiple: false);
+                Interlocked.Increment(ref _ackedCount);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Ack 消息失败: {DeliveryTag}", item.DeliveryTag);
+            }
+        }
+
+        /// <summary>
+        /// 安全拒绝消息
+        /// </summary>
+        private void TryNackMessage(BatchItem item, bool requeue)
+        {
+            try
+            {
+                if (item.Channel == null)
+                {
+                    LogDebug($"[NACK_FAIL] 通道为 null, DeliveryTag={item.DeliveryTag}, Seq=#{item.SequenceNumber}");
+                    return;
+                }
+                if (!item.Channel.IsOpen)
+                {
+                    LogDebug($"[NACK_FAIL] 通道已关闭, DeliveryTag={item.DeliveryTag}, Seq=#{item.SequenceNumber}, requeue={requeue}");
+                    return;
+                }
+                item.Channel.BasicNack(deliveryTag: item.DeliveryTag, multiple: false, requeue: requeue);
+                Interlocked.Increment(ref _nackedCount);
+                LogDebug($"[NACK] Nack 消息, DeliveryTag={item.DeliveryTag}, Seq=#{item.SequenceNumber}, requeue={requeue}");
+            }
+            catch (Exception ex)
+            {
+                LogDebug($"[NACK_ERROR] Nack 异常, DeliveryTag={item.DeliveryTag}, Seq=#{item.SequenceNumber}, Error={ex.Message}");
             }
         }
 
@@ -285,55 +380,71 @@ namespace AspNetCoreWebApi.Services.Messaging
             {
                 _logger.LogInformation("剩余数据: {Count} 条", remaining.Count);
 
-                try
+                var forecasts = new List<WeatherForecast>();
+                var successItems = new List<BatchItem>();
+                
+                foreach (var item in remaining)
                 {
-                    var forecasts = new List<WeatherForecast>();
-                    foreach (var item in remaining)
+                    try
                     {
-                        try
-                        {
-                            var taskData = MessagePackSerializer.Deserialize<AsyncProcessRequest>(
-                                item.Message, MessagePackSerializerOptions.Standard);
+                        var taskData = MessagePackSerializer.Deserialize<AsyncProcessRequest>(
+                            item.Message, MessagePackSerializerOptions.Standard);
 
-                            if (taskData != null)
-                            {
-                                forecasts.Add(new WeatherForecast
-                                {
-                                    Date = DateTime.UtcNow,
-                                    TemperatureC = _random.Next(-20, 55),
-                                    Summary = taskData.TaskType ?? "Processed"
-                                });
-                            }
-                        }
-                        catch
+                        if (taskData != null)
                         {
-                            // 优雅停机阶段遇到反序列化错误，直接丢弃
-                            item.Channel.BasicNack(deliveryTag: item.DeliveryTag, multiple: false, requeue: false);
+                            forecasts.Add(new WeatherForecast
+                            {
+                                Date = DateTime.UtcNow,
+                                TemperatureC = _random.Next(-20, 55),
+                                Summary = taskData.TaskType ?? "Processed"
+                            });
+                            successItems.Add(item);
+                        }
+                        else
+                        {
+                            // 空消息，直接确认
+                            TryAckMessage(item);
                         }
                     }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "优雅停机阶段反序列化失败，消息丢弃: {DeliveryTag}", item.DeliveryTag);
+                        TryNackMessage(item, requeue: false);
+                    }
+                }
 
-                    if (forecasts.Count > 0)
+                if (forecasts.Count > 0)
+                {
+                    try
                     {
                         using var scope = _scopeFactory.CreateScope();
                         var dbContext = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
                         dbContext.WeatherForecasts.AddRange(forecasts);
                         await dbContext.SaveChangesAsync();
 
-                        foreach (var item in remaining)
+                        // 只确认成功处理的消息
+                        foreach (var item in successItems)
                         {
-                            try { item.Channel.BasicAck(deliveryTag: item.DeliveryTag, multiple: false); } catch { }
+                            TryAckMessage(item);
                         }
 
                         _logger.LogInformation("剩余数据已写入: {Count} 条", forecasts.Count);
                     }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "处理剩余数据写入数据库失败，将剩余消息退回队列");
-                    // 🔥【核心修复点3】：优雅停机时如果写入失败，也要让消息回退
-                    foreach (var item in remaining)
+                    catch (Exception ex)
                     {
-                        try { item.Channel.BasicNack(deliveryTag: item.DeliveryTag, multiple: false, requeue: true); } catch { }
+                        _logger.LogError(ex, "处理剩余数据写入数据库失败，将消息退回队列");
+                        foreach (var item in successItems)
+                        {
+                            TryNackMessage(item, requeue: true);
+                        }
+                    }
+                }
+                else if (successItems.Count > 0)
+                {
+                    // 不应该发生，但为了安全
+                    foreach (var item in successItems)
+                    {
+                        TryAckMessage(item);
                     }
                 }
             }
@@ -368,6 +479,7 @@ namespace AspNetCoreWebApi.Services.Messaging
             public ulong DeliveryTag { get; set; }
             public IModel Channel { get; set; }
             public byte[] Message { get; set; }
+            public int SequenceNumber { get; set; }  // 用于追踪
         }
     }
 }

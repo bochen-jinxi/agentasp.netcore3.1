@@ -29,6 +29,8 @@ namespace AspNetCoreWebApi.Extensions
                 (MicroBatchPublisher)sp.GetRequiredService<IMicroBatchPublisher>());
             // 启用订单事件消费者
             services.AddHostedService<OrderEventConsumer>();
+            // 启用缓冲区刷新服务，确保不丢失消息
+            services.AddHostedService<BufferFlushService>();
             return services;
         }
 
