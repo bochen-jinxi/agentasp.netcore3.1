@@ -4,7 +4,7 @@ using Microsoft.AspNetCore.Mvc;
 namespace AspNetCoreWebApi.Controllers
 {
     /// <summary>
-    /// 健康检查控制器
+    /// 健康检查控制器5555
     /// </summary>
     [ApiController]
     [Route("api/v1/[controller]")]
