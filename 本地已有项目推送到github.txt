@@ -1,0 +1,15 @@
+现在网站建立仓库 https://github.com/bochen-jinxi/agentasp.netcore3.1.git
+
+在到本地电脑的项目文件夹下执行以下命令
+
+git init
+
+git add .
+
+git commit -m "first commit"
+ 
+git remote add origin https://github.com/bochen-jinxi/agentasp.netcore3.1.git
+
+
+git push -u origin master
+
